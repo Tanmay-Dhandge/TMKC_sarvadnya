@@ -13,7 +13,6 @@ app.use(cors());
 /* ═══════════════════════════════════════
    MONGODB
 ═══════════════════════════════════════ */
-// NEW — no options needed, Mongoose handles it automatically
 mongoose.connect(process.env.MONGO_URI)
   .catch(err => console.error('MongoDB error:', err));
 
@@ -123,8 +122,8 @@ app.post('/api/verify-payment', async (req, res) => {
       razorpay_order_id,
       razorpay_payment_id,
       razorpay_signature,
-      items,
-      totalAmount,
+      items,        // FIX: now received from frontend
+      totalAmount,  // FIX: now received from frontend
     } = req.body;
 
     /* signature check */
@@ -137,37 +136,45 @@ app.post('/api/verify-payment', async (req, res) => {
     if (expected !== razorpay_signature)
       return res.status(400).json({ success: false, error: 'Invalid signature' });
 
-    /* save transaction */
+    // FIX: Guard against duplicate transaction IDs gracefully
+    const existing = await Transaction.findOne({ transactionId: razorpay_payment_id });
+    if (existing) {
+      return res.json({ success: true, transactionId: razorpay_payment_id, duplicate: true });
+    }
+
+    /* save transaction FIRST, then decrement stock, then publish MQTT */
     const txn = await Transaction.create({
       transactionId:     razorpay_payment_id,
       razorpayOrderId:   razorpay_order_id,
       razorpaySignature: razorpay_signature,
       timestamp:         new Date(),
       paymentMethod:     'ONLINE',
-      items,
-      totalAmount,
+      items:             items || [],
+      totalAmount:       totalAmount || 0,
       status:            'SUCCESS',
     });
 
-    /* decrement stock */
-    for (const item of items) {
-      await Stock.findOneAndUpdate(
-        { slot: item.slot },
-        {
-          $inc: { stock: -item.qty },
-          $set: { updatedAt: new Date() },
-        }
-      );
+    /* FIX: Decrement stock with floor guard — stock cannot go below 0 */
+    if (items && items.length) {
+      for (const item of items) {
+        await Stock.findOneAndUpdate(
+          { slot: item.slot, stock: { $gte: item.qty } }, // only decrement if enough stock
+          {
+            $inc: { stock: -item.qty },
+            $set: { updatedAt: new Date() },
+          }
+        );
+      }
     }
 
-    /* publish to MQTT */
+    /* FIX: Publish to MQTT only after successful DB save */
     const payload = {
       transactionId:   razorpay_payment_id,
       razorpayOrderId: razorpay_order_id,
       timestamp:       txn.timestamp,
       paymentMethod:   'ONLINE',
-      items,
-      totalAmount,
+      items:           items || [],
+      totalAmount:     totalAmount || 0,
       currency:        'INR',
       status:          'SUCCESS',
     };
@@ -186,7 +193,7 @@ app.get('/api/transactions', async (req, res) => {
   try {
     const limit  = parseInt(req.query.limit)  || 100;
     const offset = parseInt(req.query.offset) || 0;
-    const status = req.query.status;            // optional filter
+    const status = req.query.status;
 
     const filter = status ? { status } : {};
     const [txns, total] = await Promise.all([
@@ -228,7 +235,7 @@ app.post('/api/stock/restock', async (req, res) => {
   }
 });
 
-/* ── DASHBOARD SUMMARY (single call for metrics) ── */
+/* ── DASHBOARD SUMMARY ── */
 app.get('/api/summary', async (req, res) => {
   try {
     const [txns, stock] = await Promise.all([
@@ -239,7 +246,6 @@ app.get('/api/summary', async (req, res) => {
     const success = txns.filter(t => t.status === 'SUCCESS');
     const failed  = txns.filter(t => t.status === 'FAILED');
 
-    /* revenue per day last 7 days */
     const now     = new Date();
     const revByDay = [];
     for (let i = 6; i >= 0; i--) {
@@ -253,7 +259,6 @@ app.get('/api/summary', async (req, res) => {
       });
     }
 
-    /* units sold per product */
     const soldBySlot = {};
     success.forEach(t => {
       (t.items || []).forEach(i => {
